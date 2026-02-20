@@ -5,25 +5,30 @@ from collections import deque
 import matplotlib.pyplot as plt
 import numpy as np
 
+interval = 52 # microseconds Arduino Sampling interval
+max_points = 500000
+T = interval * max_points / 1000000 # in second, Total time
+print (T)
 
 
-ser = serial.Serial("COM4", 1000000)
+ser = serial.Serial("COM4", 1000000)   
+# COM4 must match the name in windows manager, 1000000 is Boud rate, must match that in Arduino i.e. fast_reader.ino
 
-ser.reset_input_buffer()
 
 #print(data[:10])
 #print("Mean:", data.astype(np.uint32).mean())
 
 
-max_points = 500000
 data = deque([0.0] * max_points, maxlen=max_points)    #   A fixed-size rolling buffer pre-filled with zeros that automatically keeps only the most recent max_points values — perfect for real-time plots.
 
 start = time.time()
 now = time.time()
 
 
+ser.reset_input_buffer()
+# Clear the serial to receive fresh data
 
-while (now-start)<40: #True:
+while (now-start)<(1.5*T): #True:
     raw = ser.read(2)
     value = struct.unpack('<H', raw)[0]  # unsigned 16-bit
     #print(value)  # 0–4095
@@ -73,4 +78,5 @@ ax.set_title("Autocorrelation of (Data- mean)")
 ax.set_xlabel("Sample interval")
 ax.set_ylabel("Value")
 plt.savefig("dls-colloid_3.png")    
+
 plt.show()
