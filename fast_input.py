@@ -3,6 +3,9 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import serial
+import json
+from datetime import datetime
+from tqdm import tqdm
 
 # =========================== USER PARAMETERS ===========================
 PORT = "COM4"                 # Must match Windows Device Manager (Ports -> COMx)
@@ -28,7 +31,7 @@ PRINT_FIRST_N = 20            # Print first N raw samples for manual protocol/al
 
 # Plot controls
 PLOT_STRIDE = 10              # Plot every Nth point (downsampling for speed)
-SMOOTH_WINDOW_SAMPLES = 51    # Centered moving average window for PLOTTING ONLY (odd recommended; 1 disables)
+SMOOTH_WINDOW_SAMPLES = 5    # Centered moving average window for PLOTTING ONLY (odd recommended; 1 disables)
 SMOOTH_PAD_MODE = "edge"      # "edge" or "reflect"
 Y_MARGIN_FACTOR = 1.2         # Expand y-limits away from zero
 
@@ -51,6 +54,63 @@ def get_output_dir():
         return os.path.dirname(os.path.abspath(__file__))
     except NameError:
         return os.getcwd()
+
+
+def get_experiment_info():
+    """
+    Get experiment name and metadata from user input.
+    """
+    name = input("Enter experiment name: ").strip() or "default"
+    
+    enter_metadata = input("Enter metadata manually? (y/n) [n]: ").strip().lower()
+    if enter_metadata == 'y':
+        scatter_angle = input("Scatter angle (degrees) [90]: ").strip()
+        sample_date = input("Sample date (YYYY-MM-DD) [today]: ").strip()
+        sample_number = input("Sample number [1]: ").strip()
+        colloid_type = input("Colloid type (brand) [unknown]: ").strip()
+        diameter = input("Diameter (nm) [100]: ").strip()
+        concentration = input("Concentration [1%]: ").strip()
+        framerate = input("Framerate (Hz) [auto]: ").strip()
+        notes = input("General notes: ").strip()
+    else:
+        scatter_angle = ""
+        sample_date = ""
+        sample_number = ""
+        colloid_type = ""
+        diameter = ""
+        concentration = ""
+        framerate = ""
+        notes = ""
+    
+    # Set defaults
+    diameter = diameter or "100"
+    concentration = concentration or "1%"
+    framerate = framerate or str(1/DT_S)
+    notes = notes or ""
+    
+    capture_time = datetime.now().isoformat()
+    
+    metadata_raw = {
+        "scatter_angle": scatter_angle,
+        "sample_date": sample_date,
+        "sample_number": sample_number,
+        "colloid_type": colloid_type,
+        "diameter": diameter,
+        "concentration": concentration,
+        "capture_time": capture_time,
+        "framerate": framerate,
+        "notes": notes
+    }
+    
+    # Primary results metadata (placeholders)
+    metadata_primary = {
+        "filtering_criterion": "none",
+        "range": "full",
+        "rolling_average_removed": SMOOTH_WINDOW_SAMPLES,
+        "notes": notes
+    }
+    
+    return name, metadata_raw, metadata_primary
 
 
 def auto_ylim(y, factor):
@@ -131,11 +191,13 @@ def read_u16_samples(ser, n_samples, block_samples):
     """
     out = np.empty(n_samples, dtype=np.uint16)
     idx = 0
-    while idx < n_samples:
-        n = min(block_samples, n_samples - idx)
-        raw = read_exactly(ser, 2 * n)
-        out[idx:idx + n] = np.frombuffer(raw, dtype="<u2")
-        idx += n
+    with tqdm(total=n_samples, desc="Reading data", unit="samples") as pbar:
+        while idx < n_samples:
+            n = min(block_samples, n_samples - idx)
+            raw = read_exactly(ser, 2 * n)
+            out[idx:idx + n] = np.frombuffer(raw, dtype="<u2")
+            idx += n
+            pbar.update(n)
     return out
 
 
@@ -150,7 +212,7 @@ def autocorr_limited(x, max_lag):
     max_lag = int(min(max_lag, N - 1))
 
     acf = np.empty(max_lag + 1, dtype=np.float64)
-    for lag in range(max_lag + 1):
+    for lag in tqdm(range(max_lag + 1), desc="Computing autocorrelation"):
         acf[lag] = np.dot(x[:N - lag], x[lag:])
 
     if acf[0] == 0:
@@ -159,7 +221,27 @@ def autocorr_limited(x, max_lag):
 
 
 def main():
-    out_dir = get_output_dir()
+    base_dir = get_output_dir()
+    
+    # Get experiment info
+    exp_name, metadata_raw, metadata_primary = get_experiment_info()
+    
+    # Create timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_dir_name = f"{timestamp}_{exp_name}"
+    
+    # Create directories
+    data_dir = os.path.join(base_dir, "Data")
+    primary_results_dir = os.path.join(base_dir, "Primary_results")
+    secondary_results_dir = os.path.join(base_dir, "Secondary_results")
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(primary_results_dir, exist_ok=True)
+    os.makedirs(secondary_results_dir, exist_ok=True)
+    
+    print(f"Experiment: {exp_dir_name}")
+    print(f"Data will be saved to: {data_dir}")
+    print(f"Primary results will be saved to: {primary_results_dir}")
+    print(f"Secondary results will be saved to: {secondary_results_dir}")
 
     n_acquire = int(np.ceil(N_POINTS_KEEP * ACQUIRE_FACTOR))
     t_keep_s = N_POINTS_KEEP * DT_S
@@ -169,7 +251,6 @@ def main():
     print(f"Keeping {N_POINTS_KEEP} samples -> nominal T_keep = {t_keep_s:.3f} s")
     print(f"Acquiring {n_acquire} samples (factor {ACQUIRE_FACTOR}) -> nominal T_acquire = {t_acquire_s:.3f} s")
     print(f"Plot stride = {PLOT_STRIDE}, smooth window = {SMOOTH_WINDOW_SAMPLES} samples")
-    print(f"Saving outputs to: {out_dir}")
 
     first_n = min(PRINT_FIRST_N, n_acquire)
     remaining_n = n_acquire - first_n
@@ -214,17 +295,23 @@ def main():
     # Build time axis in seconds (based on nominal dt)
     t = np.arange(N_POINTS_KEEP, dtype=np.float64) * DT_S
 
-    # Save raw data used for analysis (same folder as this script)
+    # Save raw data used for analysis
     if SAVE_RAW_NPZ:
-        npz_path = os.path.join(out_dir, f"{SAVE_PREFIX}_raw.npz")
+        npz_path = os.path.join(data_dir, f"{exp_dir_name}.npz")
         np.savez(npz_path, time_s=t, counts_u16=data_counts, volts=data_volts)
         print(f"Saved raw data (npz): {npz_path}")
 
     if SAVE_RAW_CSV:
-        csv_path = os.path.join(out_dir, f"{SAVE_PREFIX}_raw.csv")
+        csv_path = os.path.join(data_dir, f"{exp_dir_name}.csv")
         arr = np.column_stack([t, data_counts.astype(np.int64), data_volts])
         np.savetxt(csv_path, arr, delimiter=",", header="time_s,counts_u16,volts", comments="")
         print(f"Saved raw data (csv): {csv_path}")
+
+    # Save raw data metadata
+    metadata_raw_path = os.path.join(data_dir, f"{exp_dir_name}.metadata")
+    with open(metadata_raw_path, 'w') as f:
+        json.dump(metadata_raw, f, indent=4)
+    print(f"Saved raw metadata: {metadata_raw_path}")
 
     # ---- Plotting uses smoothed signal (display only) ----
     v_smooth = moving_average_centered(data_volts, SMOOTH_WINDOW_SAMPLES, pad_mode=SMOOTH_PAD_MODE)
@@ -245,10 +332,10 @@ def main():
     ax.set_ylim(*auto_ylim(v_smooth, factor=Y_MARGIN_FACTOR))
     fig.tight_layout()
 
-    fig_path = os.path.join(out_dir, f"{SAVE_PREFIX}_data_voltage.png")
+    fig_path = os.path.join(data_dir, f"{exp_dir_name}_data_voltage.png")
     fig.savefig(fig_path, dpi=200)
     print(f"Saved figure: {fig_path}")
-    plt.show()
+    plt.close(fig)  # Close to avoid display issues
 
     # Plot 2: (Voltage - mean) vs time
     fig, ax = plt.subplots()
@@ -260,10 +347,10 @@ def main():
     ax.set_ylim(*auto_ylim(v_smooth_demean, factor=Y_MARGIN_FACTOR))
     fig.tight_layout()
 
-    fig_path = os.path.join(out_dir, f"{SAVE_PREFIX}_data_voltage_demean.png")
+    fig_path = os.path.join(data_dir, f"{exp_dir_name}_data_voltage_demean.png")
     fig.savefig(fig_path, dpi=200)
     print(f"Saved figure: {fig_path}")
-    plt.show()
+    plt.close(fig)
 
     # ---- Autocorrelation uses RAW data (unsmoothed) ----
     acf = autocorr_limited(data_volts, max_lag=MAX_LAG)
@@ -278,10 +365,24 @@ def main():
     ax.set_ylim(-1.0, 1.0)
     fig.tight_layout()
 
-    fig_path = os.path.join(out_dir, f"{SAVE_PREFIX}_acf.png")
+    fig_path = os.path.join(primary_results_dir, f"{exp_dir_name}.png")
     fig.savefig(fig_path, dpi=200)
-    print(f"Saved figure: {fig_path}")
-    plt.show()
+    print(f"Saved autocorrelation figure: {fig_path}")
+    plt.close(fig)
+
+    # Save autocorrelation data as CSV
+    acf_csv_path = os.path.join(primary_results_dir, f"{exp_dir_name}.csv")
+    arr_acf = np.column_stack([tau, acf])
+    np.savetxt(acf_csv_path, arr_acf, delimiter=",", header="lag_time_s,autocorrelation", comments="")
+    print(f"Saved autocorrelation data: {acf_csv_path}")
+
+    # Save primary results metadata
+    metadata_primary_path = os.path.join(primary_results_dir, f"{exp_dir_name}.metadata")
+    with open(metadata_primary_path, 'w') as f:
+        json.dump(metadata_primary, f, indent=4)
+    print(f"Saved primary metadata: {metadata_primary_path}")
+
+    # Note: Tau_q calculation to be added later
 
 
 if __name__ == "__main__":
